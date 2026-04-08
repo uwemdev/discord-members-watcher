@@ -1,11 +1,18 @@
 
+import hashlib
 import html
 import json
 import os
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+
+if os.name == 'nt':
+    import msvcrt
+else:
+    import fcntl
 
 import discord
 import requests
@@ -21,9 +28,15 @@ if load_dotenv:
 
 JOIN_LOG_FILE = 'join_events.log'
 LAST_MEMBERS_FILE = Path(__file__).with_name('last_members.json')
+LAST_MEMBERS_LOCK_FILE = Path(__file__).with_name('last_members.lock')
+MESSAGE_CACHE_FILE = Path(__file__).with_name('sent_messages.json')
+BOT_INSTANCE_LOCK_FILE = Path(__file__).with_name('bot.instance.lock')
 JOIN_DEDUPE_WINDOW_SECONDS = 10 * 60
+TELEGRAM_DEDUPE_WINDOW_SECONDS = 60 * 60
 RECENT_JOIN_CACHE_LIMIT = 200
+RECENT_MESSAGE_CACHE_LIMIT = 500
 join_state_lock = Lock()
+instance_lock_handle = None
 
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
@@ -48,6 +61,54 @@ if hasattr(discord, 'Intents'):
 bot = commands.Bot(command_prefix='!', **bot_options)
 
 
+def ensure_lockfile_seeded(handle):
+    handle.seek(0)
+    if not handle.read(1):
+        handle.write('0')
+        handle.flush()
+    handle.seek(0)
+
+
+@contextmanager
+def last_members_file_lock():
+    LAST_MEMBERS_LOCK_FILE.touch(exist_ok=True)
+    with LAST_MEMBERS_LOCK_FILE.open('r+', encoding='utf-8') as handle:
+        ensure_lockfile_seeded(handle)
+        if os.name == 'nt':
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == 'nt':
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def acquire_instance_lock():
+    global instance_lock_handle
+
+    BOT_INSTANCE_LOCK_FILE.touch(exist_ok=True)
+    handle = BOT_INSTANCE_LOCK_FILE.open('r+', encoding='utf-8')
+    ensure_lockfile_seeded(handle)
+
+    try:
+        if os.name == 'nt':
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+
+    instance_lock_handle = handle
+    return True
+
+
 def load_last_members():
     if not LAST_MEMBERS_FILE.exists():
         return {}
@@ -58,7 +119,6 @@ def load_last_members():
     except (OSError, json.JSONDecodeError):
         return {}
 
-    now = int(time.time())
     normalized = {}
 
     for guild_id, entries in raw_data.items():
@@ -70,7 +130,7 @@ def load_last_members():
                 except (TypeError, ValueError):
                     continue
         elif isinstance(entries, list):
-            member_times = {str(member_id): now for member_id in entries}
+            member_times = {str(member_id): 0 for member_id in entries}
         else:
             continue
 
@@ -80,13 +140,12 @@ def load_last_members():
     return normalized
 
 
-recent_join_cache = load_last_members()
-
-
 def save_last_members(data):
     try:
-        with LAST_MEMBERS_FILE.open('w', encoding='utf-8') as handle:
+        temp_file = LAST_MEMBERS_FILE.with_suffix('.json.tmp')
+        with temp_file.open('w', encoding='utf-8') as handle:
             json.dump(data, handle, ensure_ascii=False)
+        temp_file.replace(LAST_MEMBERS_FILE)
     except OSError as exc:
         print(f'Failed to save recent join cache: {exc}')
 
@@ -97,33 +156,97 @@ def is_already_seen(guild_id, member_id):
     member_key = str(member_id)
 
     with join_state_lock:
-        for cached_guild_id in list(recent_join_cache):
-            member_times = recent_join_cache.get(cached_guild_id, {})
-            fresh_member_times = {
-                cached_member_id: seen_at
-                for cached_member_id, seen_at in member_times.items()
-                if now - int(seen_at) < JOIN_DEDUPE_WINDOW_SECONDS
+        with last_members_file_lock():
+            recent_join_cache = load_last_members()
+
+            for cached_guild_id in list(recent_join_cache):
+                member_times = recent_join_cache.get(cached_guild_id, {})
+                fresh_member_times = {
+                    cached_member_id: int(seen_at)
+                    for cached_member_id, seen_at in member_times.items()
+                    if int(seen_at) and now - int(seen_at) < JOIN_DEDUPE_WINDOW_SECONDS
+                }
+                if fresh_member_times:
+                    recent_join_cache[cached_guild_id] = fresh_member_times
+                else:
+                    recent_join_cache.pop(cached_guild_id, None)
+
+            guild_entries = recent_join_cache.setdefault(guild_key, {})
+            last_seen = int(guild_entries.get(member_key, 0))
+            if last_seen and now - last_seen < JOIN_DEDUPE_WINDOW_SECONDS:
+                save_last_members(recent_join_cache)
+                return True
+
+            guild_entries[member_key] = now
+            if len(guild_entries) > RECENT_JOIN_CACHE_LIMIT:
+                recent_items = sorted(guild_entries.items(), key=lambda item: item[1], reverse=True)[:RECENT_JOIN_CACHE_LIMIT]
+                recent_join_cache[guild_key] = dict(recent_items)
+
+            save_last_members(recent_join_cache)
+            return False
+
+
+def load_message_cache():
+    if not MESSAGE_CACHE_FILE.exists():
+        return {}
+
+    try:
+        with MESSAGE_CACHE_FILE.open('r', encoding='utf-8') as handle:
+            raw_data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    normalized = {}
+    for fingerprint, seen_at in raw_data.items():
+        try:
+            normalized[str(fingerprint)] = int(seen_at)
+        except (TypeError, ValueError):
+            continue
+
+    return normalized
+
+
+def save_message_cache(data):
+    try:
+        temp_file = MESSAGE_CACHE_FILE.with_suffix('.json.tmp')
+        with temp_file.open('w', encoding='utf-8') as handle:
+            json.dump(data, handle, ensure_ascii=False)
+        temp_file.replace(MESSAGE_CACHE_FILE)
+    except OSError as exc:
+        print(f'Failed to save Telegram dedupe cache: {exc}')
+
+
+def is_duplicate_telegram_message(text, image_url=None):
+    now = int(time.time())
+    fingerprint = hashlib.sha256(f'{text}\n{image_url or ""}'.encode('utf-8')).hexdigest()
+
+    with join_state_lock:
+        with last_members_file_lock():
+            message_cache = load_message_cache()
+            message_cache = {
+                cached_fingerprint: int(seen_at)
+                for cached_fingerprint, seen_at in message_cache.items()
+                if now - int(seen_at) < TELEGRAM_DEDUPE_WINDOW_SECONDS
             }
-            if fresh_member_times:
-                recent_join_cache[cached_guild_id] = fresh_member_times
-            else:
-                recent_join_cache.pop(cached_guild_id, None)
 
-        guild_entries = recent_join_cache.setdefault(guild_key, {})
-        last_seen = int(guild_entries.get(member_key, 0))
-        if last_seen and now - last_seen < JOIN_DEDUPE_WINDOW_SECONDS:
-            return True
+            if fingerprint in message_cache:
+                save_message_cache(message_cache)
+                return True
 
-        guild_entries[member_key] = now
-        if len(guild_entries) > RECENT_JOIN_CACHE_LIMIT:
-            recent_items = sorted(guild_entries.items(), key=lambda item: item[1], reverse=True)[:RECENT_JOIN_CACHE_LIMIT]
-            recent_join_cache[guild_key] = dict(recent_items)
+            message_cache[fingerprint] = now
+            if len(message_cache) > RECENT_MESSAGE_CACHE_LIMIT:
+                recent_items = sorted(message_cache.items(), key=lambda item: item[1], reverse=True)[:RECENT_MESSAGE_CACHE_LIMIT]
+                message_cache = dict(recent_items)
 
-        save_last_members(recent_join_cache)
-        return False
+            save_message_cache(message_cache)
+            return False
 
 
 def send_telegram_message(text, image_url=None):
+    if is_duplicate_telegram_message(text, image_url=image_url):
+        print('Skipping duplicate Telegram notification with matching content.')
+        return
+
     base_url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
     try:
         if image_url:
@@ -192,6 +315,10 @@ async def on_member_join(member):
 
 
 def main():
+    if not acquire_instance_lock():
+        print('Another bot instance is already running; exiting to prevent duplicate Telegram alerts.')
+        return
+
     while True:
         print('Bot starting...')
         try:

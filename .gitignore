@@ -3,3 +3,6 @@ __pycache__/
 .env
 join_events.log
 last_members.json
+last_members.lock
+sent_messages.json
+bot.instance.lock
