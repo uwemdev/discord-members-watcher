@@ -158,6 +158,23 @@ def get_next_channel():
         return TELEGRAM_CHANNELS[index]
 
 
+def format_message_for_channel(text, channel):
+    if channel != TELEGRAM_CHANNEL_2:
+        return text
+
+    lines = text.splitlines()
+    if not lines:
+        return text
+
+    alt_lines = ["⚡ <b>Member Update</b>"]
+
+    for line in lines[1:]:
+        cleaned = line.lstrip("🎉👤🏠 ")
+        alt_lines.append(f"• {cleaned}")
+
+    return "\n".join(alt_lines)
+
+
 # SEND TELEGRAM
 def send_telegram_message(text, image_url=None):
     if is_duplicate_telegram_message(text, image_url):
@@ -166,6 +183,7 @@ def send_telegram_message(text, image_url=None):
 
     base_url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
     channel = get_next_channel()
+    formatted_text = format_message_for_channel(text, channel)
 
     try:
         if image_url:
@@ -174,7 +192,7 @@ def send_telegram_message(text, image_url=None):
                 data={
                     'chat_id': channel,
                     'photo': image_url,
-                    'caption': text[:1024],
+                    'caption': formatted_text[:1024],
                     'parse_mode': 'HTML'
                 },
                 timeout=20
@@ -187,7 +205,7 @@ def send_telegram_message(text, image_url=None):
             f'{base_url}/sendMessage',
             data={
                 'chat_id': channel,
-                'text': text,
+                'text': formatted_text,
                 'parse_mode': 'HTML',
                 'disable_web_page_preview': True
             },
