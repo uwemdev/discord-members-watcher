@@ -23,6 +23,7 @@ if load_dotenv:
 JOIN_LOG_FILE = 'join_events.log'
 LAST_MEMBERS_FILE = Path(__file__).with_name('last_members.json')
 MESSAGE_CACHE_FILE = Path(__file__).with_name('sent_messages.json')
+ROUND_ROBIN_FILE = Path(__file__).with_name('channel_index.json')
 
 # SETTINGS
 JOIN_DEDUPE_WINDOW_SECONDS = 10 * 60
@@ -132,6 +133,31 @@ def is_duplicate_telegram_message(text, image_url=None):
         return False
 
 
+def get_next_channel():
+    with lock:
+        data = {"index": 0}
+
+        if ROUND_ROBIN_FILE.exists():
+            try:
+                with ROUND_ROBIN_FILE.open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except:
+                data = {"index": 0}
+
+        index = int(data.get("index", 0)) % len(TELEGRAM_CHANNELS)
+        next_index = (index + 1) % len(TELEGRAM_CHANNELS)
+
+        data["index"] = next_index
+
+        try:
+            with ROUND_ROBIN_FILE.open('w', encoding='utf-8') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Channel index save error: {e}")
+
+        return TELEGRAM_CHANNELS[index]
+
+
 # SEND TELEGRAM
 def send_telegram_message(text, image_url=None):
     if is_duplicate_telegram_message(text, image_url):
@@ -139,39 +165,39 @@ def send_telegram_message(text, image_url=None):
         return
 
     base_url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}'
+    channel = get_next_channel()
 
-    for channel in TELEGRAM_CHANNELS:
-        try:
-            if image_url:
-                r = requests.post(
-                    f'{base_url}/sendPhoto',
-                    data={
-                        'chat_id': channel,
-                        'photo': image_url,
-                        'caption': text[:1024],
-                        'parse_mode': 'HTML'
-                    },
-                    timeout=20
-                )
-                if r.ok:
-                    print(f"Sent to {channel}")
-                    continue
-
-            requests.post(
-                f'{base_url}/sendMessage',
+    try:
+        if image_url:
+            r = requests.post(
+                f'{base_url}/sendPhoto',
                 data={
                     'chat_id': channel,
-                    'text': text,
-                    'parse_mode': 'HTML',
-                    'disable_web_page_preview': True
+                    'photo': image_url,
+                    'caption': text[:1024],
+                    'parse_mode': 'HTML'
                 },
                 timeout=20
             )
+            if r.ok:
+                print(f"Sent to {channel}")
+                return
 
-            print(f"Sent to {channel}")
+        requests.post(
+            f'{base_url}/sendMessage',
+            data={
+                'chat_id': channel,
+                'text': text,
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': True
+            },
+            timeout=20
+        )
 
-        except Exception as e:
-            print(f"Telegram error for {channel}: {e}")
+        print(f"Sent to {channel}")
+
+    except Exception as e:
+        print(f"Telegram error for {channel}: {e}")
 
 
 # EVENTS
